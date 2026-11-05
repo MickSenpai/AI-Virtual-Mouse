@@ -135,6 +135,15 @@ python main.py
 - Perform any gesture from the [Gesture Guide](#gesture-guide) to control your cursor.
 - Press **`q`** with the video window focused to quit.
 
+Because your hand is driving the cursor, there are also **global hotkeys** that work no matter which window has focus:
+
+| Hotkey | Action |
+|---|---|
+| `Ctrl` + `Alt` + `P` | Pause / resume cursor control (the video keeps running) |
+| `Ctrl` + `Alt` + `Q` | Quit |
+
+**Clicks are locked until you show the Move pose.** Whenever your hand enters the frame (or control is resumed), click, double-click and screenshot gestures are ignored until the system has seen the Move gesture once — so a hand entering the frame with curled fingers can't click by accident. The overlay shows `Clicks: Armed` or `Locked`.
+
 Screenshots are saved automatically to a `Screenshots/` folder created in the project directory, named like `Screenshot_2025-07-17_14-32-05.png`.
 
 ## Configuration
@@ -149,10 +158,16 @@ All tunable behavior lives as named constants at the top of `main.py` — no nee
 | `DOUBLE_CLICK_COOLDOWN` | `1.0` s | Minimum interval between double clicks |
 | `SCREENSHOT_COOLDOWN` | `2.0` s | Minimum interval between screenshots |
 | `SCROLL_COOLDOWN` | `0.15` s | Minimum interval between individual scroll ticks |
-| `SCROLL_SPEED` | `40` | Scroll units applied per tick |
-| `DEAD_ZONE` | `4` px | Minimum cursor displacement required before moving |
+| `SCROLL_PIXELS_PER_TICK` | `8` px | Vertical hand movement per scroll tick (moving faster scrolls more) |
+| `SCROLL_MAX_TICKS` | `5` | Maximum scroll ticks applied in a single step |
+| `DEAD_ZONE` | `4` px | The cursor ignores fingertip movement smaller than this, to kill jitter |
 | `SCROLL_DEAD_ZONE_PX` | `8` px | Minimum vertical movement required to register a scroll tick |
-| `PINCH_THRESHOLD` | `40` | Thumb-tip/index-tip distance below which a pinch (drag) is registered |
+| `PINCH_THRESHOLD` | `40` | Thumb-tip/index-tip distance below which a pinch (drag) is registered (normalized by hand size) |
+| `HAND_REFERENCE_SIZE` | `225` | Wrist-to-middle-knuckle distance the distance thresholds were tuned for; distances are rescaled to it so gestures work at any camera distance |
+| `HAND_SCALE_MIN` / `HAND_SCALE_MAX` | `0.5` / `2.0` | Limits for the hand-size rescaling factor, so a foreshortened or very distant hand can't distort the distance thresholds |
+| `HOTKEY_PAUSE` / `HOTKEY_QUIT` | `<ctrl>+<alt>+p` / `<ctrl>+<alt>+q` | Global hotkeys ([pynput format](https://pynput.readthedocs.io/en/latest/keyboard.html#global-hotkeys)) |
+| `MAX_CONSECUTIVE_FRAME_ERRORS` | `30` | Frames in a row that may fail processing before the app logs the error and exits (instead of leaving a frozen window) |
+| `GESTURE_CONFIRM_FRAMES` | `3` | Consecutive frames a gesture must be seen before it activates; clicks fire once per gesture |
 | `CAMERA_WIDTH` / `CAMERA_HEIGHT` | `640 × 480` | Requested webcam capture resolution |
 | `MIN_DETECTION_CONFIDENCE` / `MIN_TRACKING_CONFIDENCE` | `0.7` / `0.7` | MediaPipe Hands confidence thresholds |
 
@@ -172,7 +187,12 @@ AI-Virtual_Mouse/
         └── Project_Report.docx     # Full project report
 ```
 
-`util.py` has no dependency on OpenCV, MediaPipe, or OS-control libraries, so its functions can be unit-tested in isolation.
+`util.py` has no dependency on OpenCV, MediaPipe, or OS-control libraries, so its functions can be unit-tested in isolation. The tests live in `tests/`; run them with:
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
 
 ## Troubleshooting
 
@@ -180,7 +200,7 @@ AI-Virtual_Mouse/
 |---|---|---|
 | `[ERROR] Could not open the camera` | Camera is in use by another app, or index `0` isn't your camera | Close other apps using the camera; try `cv2.VideoCapture(1)` |
 | Cursor is jittery | Poor lighting or a noisy webcam | Increase `SMOOTHING` or `DEAD_ZONE` in `main.py` |
-| Clicks fire repeatedly | Cooldown too short for your gesture speed | Increase `CLICK_COOLDOWN` / `DOUBLE_CLICK_COOLDOWN` |
+| Clicks fire by accident | A gesture is briefly misread for one frame | Increase `GESTURE_CONFIRM_FRAMES`, or `CLICK_COOLDOWN` / `DOUBLE_CLICK_COOLDOWN` |
 | Cursor doesn't reach screen edges | `FRAME_MARGIN` too large | Lower `FRAME_MARGIN` |
 | Gestures aren't recognized | Hand too close/far, poor lighting, or busy background | Improve lighting, use a plain background, stay ~40–70 cm from the camera |
 | Low FPS | Camera resolution too high, or CPU-bound machine | Lower `CAMERA_WIDTH`/`CAMERA_HEIGHT`, or reduce MediaPipe `model_complexity` |
