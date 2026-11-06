@@ -24,8 +24,9 @@ Press 'q' with the video window focused to quit.
 import logging
 import os
 import sys
+import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, NamedTuple, Optional, Tuple
 
@@ -54,8 +55,22 @@ log = logging.getLogger("virtual_mouse")
 # CONFIGURATION
 # --------------------------------------------------------------------------
 SMOOTHING = 0.7                 # EMA smoothing factor (0 = none, closer to 1 = smoother/laggier)
-FRAME_MARGIN = 100              # px inset from the camera frame edges used when mapping to the screen
+# Camera-frame region (px inset from each edge) that the fingertip sweeps to cover the whole screen.
+# The bottom margin is large on purpose: reaching the bottom of the screen with the fingertip must not
+# push the wrist out of the frame, because a partly visible hand makes tracking unreliable.
+FRAME_MARGIN_LEFT = 100
+FRAME_MARGIN_RIGHT = 100
+FRAME_MARGIN_TOP = 40
+FRAME_MARGIN_BOTTOM = 200
 CLICK_COOLDOWN = 0.5            # seconds between left/right clicks
+CLICK_PINCH_THRESHOLD = 40      # thumb-tip to middle/ring-tip distance (0-1000 scale) below which the pinch closes
+CLICK_PINCH_RELEASE = 70        # ...and above which it counts as open again (hysteresis)
+CLICK_PINCH_FRAMES = 2          # consecutive frames the pinch must stay closed to click
+CLICK_FREEZE_SECONDS = 0.3      # the cursor stays put this long after a pinch click (or until the pinch opens)
+MOVE_STAY_ANGLE = 70            # once moving, the index finger may bend down to this angle before Move is lost
+MOVE_STAY_THUMB_DIST = 90       # ...and the thumb may drift this far (0-1000 scale) from the index base
+STALL_LOG_SECONDS = 0.15        # a frame slower than this is logged with where the time went
+HAND_LOST_GRACE = 0.3           # seconds the last state is held when tracking drops, before everything resets
 DOUBLE_CLICK_COOLDOWN = 1.0     # seconds between double clicks
 SCREENSHOT_COOLDOWN = 2.0       # seconds between screenshots
 SCROLL_COOLDOWN = 0.15          # seconds between individual scroll "ticks"
@@ -85,18 +100,23 @@ SCREEN_WIDTH, SCREEN_HEIGHT = pyautogui.size()
 pyautogui.FAILSAFE = False  # gestures already stay within the frame; avoid corner-triggered exceptions
 pyautogui.PAUSE = 0         # default is 0.1s after every call, which caps cursor movement at ~10 FPS
 
-# Landmark indices (MediaPipe Hands): wrist, thumb tip, index base/tip, middle base.
-WRIST, THUMB_TIP, INDEX_BASE, INDEX_TIP, MIDDLE_BASE = 0, 4, 5, 8, 9
+# Landmark indices (MediaPipe Hands): wrist, thumb tip, index base/tip, middle base/tip, ring tip.
+WRIST, THUMB_TIP, INDEX_BASE, INDEX_TIP, MIDDLE_BASE, MIDDLE_TIP, RING_TIP = 0, 4, 5, 8, 9, 12, 16
 
 # On-screen label (text, BGR color) drawn for each active gesture.
 GESTURE_LABELS = {
     "Dragging": ("Gesture : Dragging", (0, 200, 255)),
     "Moving": ("Gesture : Moving", (0, 255, 0)),
-    "Left Click": ("Gesture : Left Click", (0, 255, 0)),
-    "Right Click": ("Gesture : Right Click", (0, 0, 255)),
     "Double Click": ("Gesture : Double Click", (255, 255, 0)),
 }
 SCROLL_LABEL_COLOR = (200, 0, 200)
+# Brief confirmation drawn after a pinch click (text, BGR color).
+CLICK_FLASH = {
+    "Left Click": ("Left Click", (0, 255, 0)),
+    "Right Click": ("Right Click", (0, 0, 255)),
+}
+CLICK_FLASH_SECONDS = 0.4
+SCREENSHOT_FLASH_SECONDS = 1.0  # long enough to notice an accidental screenshot
 
 
 # --------------------------------------------------------------------------
@@ -125,10 +145,24 @@ class AppState:
     armed: bool = False
     paused: bool = False          # toggled from the hotkey listener thread
     quit_requested: bool = False  # set from the hotkey listener thread
+    hand_lost_since: Optional[float] = None
+    # Click pinches (thumb to middle / ring fingertip), see update_click_pinches().
+    pinch_open: dict = field(default_factory=lambda: {"middle": False, "ring": False})
+    pinch_frames: dict = field(default_factory=lambda: {"middle": 0, "ring": 0})
+    pinch_hold: Optional[str] = None  # finger whose click just fired: cursor stays put until it opens...
+    pinch_hold_until: float = 0.0     # ...or CLICK_FREEZE_SECONDS pass, whichever comes first
+    cursor_status: str = "idle (no hand)"  # why the cursor is (not) following the finger; shown in the overlay
+    pinch_distances: Tuple[float, float] = (0.0, 0.0)  # latest (middle, ring), for the debug overlay
+    click_flash: Tuple[str, Tuple[int, int, int]] = ("", (0, 0, 0))
+    click_flash_until: float = 0.0
+    show_distances: bool = False  # toggled with the 'd' key
 
     def reset_hand_tracking(self):
-        """Forget per-hand tracking (called when the hand leaves the frame)."""
+        """Forget per-hand tracking (called when the hand has been gone longer than the grace period)."""
         self.armed = False
+        self.pinch_open = {"middle": False, "ring": False}
+        self.pinch_frames = {"middle": 0, "ring": 0}
+        self.pinch_hold = None
         self.prev_cursor = None
         self.prev_scroll_y = None
         self.active_gesture = "None"
@@ -166,17 +200,16 @@ def is_bent(angle):
     return angle < FINGER_BENT_ANGLE
 
 
-def is_move_gesture(angles, thumb_index_dist):
-    """Index finger extended while the thumb rests near the index base."""
+def is_move_gesture(angles, thumb_index_dist, keep=False):
+    """
+    Index finger extended while the thumb rests near the index base. With
+    `keep` (Move is already active) the pose is held with hysteresis, so a
+    thumb that drifts a little or an index that dips slightly doesn't drop
+    the cursor.
+    """
+    if keep:
+        return thumb_index_dist < MOVE_STAY_THUMB_DIST and angles.index > MOVE_STAY_ANGLE
     return thumb_index_dist < THUMB_NEAR_DIST and is_extended(angles.index)
-
-
-def is_left_click(angles, thumb_index_dist):
-    return is_bent(angles.index) and is_extended(angles.middle) and thumb_index_dist > THUMB_NEAR_DIST
-
-
-def is_right_click(angles, thumb_index_dist):
-    return is_bent(angles.middle) and is_extended(angles.index) and thumb_index_dist > THUMB_NEAR_DIST
 
 
 def is_double_click(angles, thumb_index_dist):
@@ -202,7 +235,7 @@ def is_scroll_pose(angles):
     )
 
 
-def classify_gesture(angles, thumb_index_dist, pinch_dist):
+def classify_gesture(angles, thumb_index_dist, pinch_dist, moving=False):
     """Return the name of the gesture matching this single frame (no debouncing)."""
     if is_pinching(pinch_dist):
         return "Dragging"
@@ -212,12 +245,8 @@ def classify_gesture(angles, thumb_index_dist, pinch_dist):
     # open-hand scroll pose would otherwise always be read as Move.
     if is_scroll_pose(angles):
         return "Scrolling"
-    if is_move_gesture(angles, thumb_index_dist):
+    if is_move_gesture(angles, thumb_index_dist, keep=moving):
         return "Moving"
-    if is_left_click(angles, thumb_index_dist):
-        return "Left Click"
-    if is_right_click(angles, thumb_index_dist):
-        return "Right Click"
     if is_double_click(angles, thumb_index_dist):
         return "Double Click"
     if is_screenshot(angles, thumb_index_dist):
@@ -242,6 +271,38 @@ def confirm_gesture(state, raw_gesture):
     return state.active_gesture
 
 
+def update_click_pinches(state, angles, d_middle, d_ring):
+    """
+    Edge-detect the click pinches: thumb tip touching the middle fingertip is a
+    left click, touching the ring fingertip a right click, while the index
+    finger stays extended and keeps pointing (so the click doesn't drag the
+    cursor along, unlike bending the index finger).
+
+    A pinch only counts after the fingertips were seen apart (> CLICK_PINCH_RELEASE)
+    since the hand appeared or the last click, so a hand whose resting pose already
+    has the thumb touching a curled finger can't click on its own. Needs the
+    clicks to be armed. Returns "Left Click", "Right Click" or None.
+    """
+    fired = None
+    for finger, dist, name in (("middle", d_middle, "Left Click"), ("ring", d_ring, "Right Click")):
+        if dist > CLICK_PINCH_RELEASE:
+            state.pinch_open[finger] = True
+            state.pinch_frames[finger] = 0
+            if state.pinch_hold == finger:
+                state.pinch_hold = None
+        elif dist < CLICK_PINCH_THRESHOLD and state.pinch_open[finger] and state.armed and is_extended(angles.index):
+            state.pinch_frames[finger] += 1
+            if state.pinch_frames[finger] >= CLICK_PINCH_FRAMES and fired is None:
+                fired = name
+                state.pinch_open[finger] = False
+                state.pinch_frames[finger] = 0
+                state.pinch_hold = finger
+                state.pinch_hold_until = time.time() + CLICK_FREEZE_SECONDS
+        else:
+            state.pinch_frames[finger] = 0
+    return fired
+
+
 # --------------------------------------------------------------------------
 # CURSOR / ACTION HANDLERS
 # --------------------------------------------------------------------------
@@ -249,8 +310,9 @@ def compute_target_cursor(index_finger_tip, frame_w, frame_h):
     """
     Map the (normalized) index-finger-tip position (x, y) to full-monitor
     screen coordinates using numpy interpolation, insetting the usable
-    camera frame by FRAME_MARGIN so the whole screen is reachable
-    without requiring the finger to reach the extreme edges.
+    camera frame by the FRAME_MARGIN_* values so the whole screen is
+    reachable without requiring the finger (or the wrist) to reach the
+    extreme edges of the frame.
 
     frame_w / frame_h are the real frame dimensions, since the camera
     may not honor the requested CAMERA_WIDTH / CAMERA_HEIGHT.
@@ -259,10 +321,10 @@ def compute_target_cursor(index_finger_tip, frame_w, frame_h):
     raw_y = index_finger_tip[1] * frame_h
 
     screen_x = util.interpolate(
-        raw_x, [FRAME_MARGIN, frame_w - FRAME_MARGIN], [0, SCREEN_WIDTH]
+        raw_x, [FRAME_MARGIN_LEFT, frame_w - FRAME_MARGIN_RIGHT], [0, SCREEN_WIDTH]
     )
     screen_y = util.interpolate(
-        raw_y, [FRAME_MARGIN, frame_h - FRAME_MARGIN], [0, SCREEN_HEIGHT]
+        raw_y, [FRAME_MARGIN_TOP, frame_h - FRAME_MARGIN_BOTTOM], [0, SCREEN_HEIGHT]
     )
 
     screen_x = util.clamp(screen_x, 0, SCREEN_WIDTH - 1)
@@ -301,16 +363,65 @@ def exclude_window_from_capture(title):
     return bool(hwnd) and bool(ctypes.windll.user32.SetWindowDisplayAffinity(hwnd, wda_excludefromcapture))
 
 
+def disable_power_throttling():
+    """
+    Opt this process out of Windows' background throttling (Windows 10 1709+ /
+    11). When the video window is minimized or hidden behind other apps,
+    Windows treats the process as background work: it runs it on slower
+    efficiency cores / lower power states (about 3x less CPU in testing) and
+    ignores its timer-resolution requests, which makes tracking lag badly.
+    Returns True on success.
+    """
+    if sys.platform != "win32":
+        return False
+    from ctypes import wintypes
+
+    class ProcessPowerThrottlingState(ctypes.Structure):
+        _fields_ = [("Version", wintypes.ULONG), ("ControlMask", wintypes.ULONG), ("StateMask", wintypes.ULONG)]
+
+    process_power_throttling = 4  # PROCESS_INFORMATION_CLASS value
+    execution_speed, ignore_timer_resolution = 0x1, 0x4
+    # StateMask 0 with a control bit set = "never throttle this".
+    state = ProcessPowerThrottlingState(1, execution_speed | ignore_timer_resolution, 0)
+
+    kernel32 = ctypes.windll.kernel32
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel32.SetProcessInformation.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+    kernel32.SetProcessInformation.restype = wintypes.BOOL
+    return bool(
+        kernel32.SetProcessInformation(
+            kernel32.GetCurrentProcess(), process_power_throttling, ctypes.byref(state), ctypes.sizeof(state)
+        )
+    )
+
+
+def read_key():
+    """
+    Non-blocking key poll that also pumps the window's events. cv2.waitKey(1)
+    sleeps a whole 15.6 ms Windows timer tick when the window is minimized and
+    has nothing to repaint, which halves the loop rate; pollKey never waits.
+    """
+    poll = getattr(cv2, "pollKey", None)
+    return (poll() if poll else cv2.waitKey(1)) & 0xFF
+
+
+def _save_screenshot(filename):
+    try:
+        pyautogui.screenshot().save(filename)
+    except Exception as exc:  # pragma: no cover - defensive
+        log.warning("Failed to save screenshot: %s", exc)
+
+
 def take_screenshot(frame):
-    """Save a timestamped screenshot into the Screenshots/ directory."""
+    """
+    Save a timestamped screenshot into the Screenshots/ directory. Grabbing and
+    PNG-encoding the screen takes ~100 ms, so it runs on a background thread
+    instead of freezing the tracking loop for several frames.
+    """
     os.makedirs(SCREENSHOT_DIR, exist_ok=True)
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     filename = os.path.join(SCREENSHOT_DIR, f"Screenshot_{timestamp}.png")
-    try:
-        image = pyautogui.screenshot()
-        image.save(filename)
-    except Exception as exc:  # pragma: no cover - defensive
-        log.warning("Failed to save screenshot: %s", exc)
+    threading.Thread(target=_save_screenshot, args=(filename,), daemon=True).start()
     cv2.putText(frame, "Screenshot Taken", (50, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
 
 
@@ -326,8 +437,8 @@ def stop_drag(state):
         state.dragging = False
 
 
-def draw_gesture_label(frame, text, color):
-    cv2.putText(frame, text, (50, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+def draw_gesture_label(frame, text, color, y=60):
+    cv2.putText(frame, text, (50, y), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
 
 
 def handle_scroll(state, landmark_list, frame):
@@ -374,10 +485,22 @@ def detect_gesture(frame, landmark_list, state):
     state.gesture_label = "None"
 
     if len(landmark_list) < 21:
+        if state.hand_lost_since is None:
+            state.hand_lost_since = now
+            state.prev_scroll_y = None  # the hand may move a lot while unseen
+        if now - state.hand_lost_since <= HAND_LOST_GRACE:
+            # Tracking often drops for a few frames (hand near the frame edge,
+            # motion blur). Hold the cursor, drag and gesture state instead of
+            # resetting, so control resumes instantly when the hand comes back.
+            state.gesture_label = "Hand lost (holding)"
+            state.cursor_status = "held (hand lost)"
+            return
         state.gesture_label = "No Hand Detected"
+        state.cursor_status = "idle (no hand)"
         stop_drag(state)
         state.reset_hand_tracking()
         return
+    state.hand_lost_since = None
 
     index_finger_tip = landmark_list[INDEX_TIP]
 
@@ -387,8 +510,12 @@ def detect_gesture(frame, landmark_list, state):
     scale = util.clamp(HAND_REFERENCE_SIZE / hand_size, HAND_SCALE_MIN, HAND_SCALE_MAX) if hand_size and hand_size > 1 else 1.0
     thumb_index_dist = util.get_distance([landmark_list[THUMB_TIP], landmark_list[INDEX_BASE]]) * scale
     pinch_dist = util.get_distance([landmark_list[THUMB_TIP], landmark_list[INDEX_TIP]]) * scale
+    d_middle = util.get_distance([landmark_list[THUMB_TIP], landmark_list[MIDDLE_TIP]]) * scale
+    d_ring = util.get_distance([landmark_list[THUMB_TIP], landmark_list[RING_TIP]]) * scale
+    state.pinch_distances = (d_middle, d_ring)
 
-    raw_gesture = classify_gesture(finger_angles(landmark_list), thumb_index_dist, pinch_dist)
+    angles = finger_angles(landmark_list)
+    raw_gesture = classify_gesture(angles, thumb_index_dist, pinch_dist, moving=state.active_gesture == "Moving")
 
     # Release an active drag as soon as the pinch is let go, without waiting
     # for the debounce.
@@ -407,27 +534,43 @@ def detect_gesture(frame, landmark_list, state):
     # Click-type gestures are ignored until the hand has shown the Move pose.
     just_started = just_started and state.armed
 
+    # Left / right click: thumb touches the middle / ring fingertip.
+    click = update_click_pinches(state, angles, d_middle, d_ring)
+    if click is not None and now - state.last_click_time > CLICK_COOLDOWN:
+        button = Button.left if click == "Left Click" else Button.right
+        state.mouse.press(button)
+        state.mouse.release(button)
+        state.last_click_time = now
+        state.click_flash = CLICK_FLASH[click]
+        state.click_flash_until = now + CLICK_FLASH_SECONDS
+
+    # While a click pinch is closing, and for a moment after it fires, the
+    # cursor stays put so the pinch can't drag the click away from its target.
+    # The hold is time-limited: a pinch merely relaxed (not fully opened) must
+    # not leave the cursor stuck.
+    cursor_frozen = (state.pinch_hold is not None and now < state.pinch_hold_until) or any(
+        state.pinch_frames.values()
+    )
+
+    state.cursor_status = f"idle (pose: {gesture})"
     if gesture == "Dragging":
         start_drag(state)
-        move_mouse(state, index_finger_tip)  # allow dragging while moving
+        if cursor_frozen:
+            state.cursor_status = "held (click pinch)"
+        else:
+            move_mouse(state, index_finger_tip)  # allow dragging while moving
+            state.cursor_status = "following (dragging)"
 
     elif gesture == "Moving":
-        move_mouse(state, index_finger_tip)
+        if cursor_frozen:
+            state.cursor_status = "held (click pinch)"
+        else:
+            move_mouse(state, index_finger_tip)
+            state.cursor_status = "following"
 
     elif gesture == "Scrolling":
         handle_scroll(state, landmark_list, frame)
-
-    elif gesture == "Left Click":
-        if just_started and now - state.last_click_time > CLICK_COOLDOWN:
-            state.mouse.press(Button.left)
-            state.mouse.release(Button.left)
-            state.last_click_time = now
-
-    elif gesture == "Right Click":
-        if just_started and now - state.last_click_time > CLICK_COOLDOWN:
-            state.mouse.press(Button.right)
-            state.mouse.release(Button.right)
-            state.last_click_time = now
+        state.cursor_status = "scrolling"
 
     elif gesture == "Double Click":
         if just_started and now - state.last_double_click_time > DOUBLE_CLICK_COOLDOWN:
@@ -438,10 +581,14 @@ def detect_gesture(frame, landmark_list, state):
         if just_started and now - state.last_screenshot_time > SCREENSHOT_COOLDOWN:
             take_screenshot(frame)
             state.last_screenshot_time = now
+            state.click_flash = ("Screenshot saved", (255, 255, 0))
+            state.click_flash_until = now + SCREENSHOT_FLASH_SECONDS
 
     label = GESTURE_LABELS.get(gesture)
     if label is not None:
         draw_gesture_label(frame, *label)
+    if now < state.click_flash_until:
+        draw_gesture_label(frame, *state.click_flash, y=90)
 
     # prev_cursor is kept across clicks/other gestures (only reset when the
     # hand is lost), so the cursor glides back instead of jumping.
@@ -472,16 +619,29 @@ def draw_tracking_visuals(frame, hand_landmarks, landmark_list, mp_draw, connect
         cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 200, 200), 2)
 
 
+def draw_active_area(frame):
+    """Outline the camera region the fingertip maps to the screen, so the hand can stay inside the frame."""
+    frame_h, frame_w = frame.shape[:2]
+    top_left = (FRAME_MARGIN_LEFT, FRAME_MARGIN_TOP)
+    bottom_right = (frame_w - FRAME_MARGIN_RIGHT, frame_h - FRAME_MARGIN_BOTTOM)
+    cv2.rectangle(frame, top_left, bottom_right, (150, 150, 0), 1)
+
+
 def draw_overlay(frame, fps, state, tracking_active):
     """Render the professional status overlay: FPS, gesture, cursor/tracking status, resolution."""
     overlay_lines = [
         f"FPS: {fps:.1f}",
         f"Gesture: {state.gesture_label}",
-        f"Cursor: {'PAUSED' if state.paused else 'Dragging' if state.dragging else 'Active' if tracking_active else 'Idle'}",
+        f"Cursor: {'PAUSED' if state.paused else state.cursor_status}",
         f"Tracking: {'Locked' if tracking_active else 'Searching...'}",
         f"Clicks: {'Armed' if state.armed else 'Locked (show Move pose first)'}",
         f"Screen Res: {SCREEN_WIDTH}x{SCREEN_HEIGHT}",
     ]
+    if state.show_distances:
+        d_middle, d_ring = state.pinch_distances
+        overlay_lines.append(
+            f"Pinch middle/ring: {d_middle:.0f} / {d_ring:.0f} (click < {CLICK_PINCH_THRESHOLD}, open > {CLICK_PINCH_RELEASE})"
+        )
 
     y = frame.shape[0] - 15 - (len(overlay_lines) - 1) * 22
     for line in overlay_lines:
@@ -523,6 +683,9 @@ def start_hotkeys(state):
 def main():
     logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 
+    if sys.platform == "win32" and not disable_power_throttling():
+        log.warning("Could not opt out of Windows power throttling; tracking may lag while the window is minimized.")
+
     mp_hands = mp.solutions.hands
     mp_draw = mp.solutions.drawing_utils
     hands = mp_hands.Hands(
@@ -546,6 +709,7 @@ def main():
     max_consecutive_failures = 30  # ~1s of dropped frames at 30 FPS before giving up
     last_frame_error = None
     consecutive_frame_errors = 0
+    last_stall_log = 0.0
     capture_exclusion_tried = False
 
     try:
@@ -554,6 +718,7 @@ def main():
             return
 
         while not state.quit_requested:
+            loop_start = time.perf_counter()
             ret, frame = cap.read()
 
             if not ret or frame is None:
@@ -565,12 +730,15 @@ def main():
                 time.sleep(0.05)
                 continue
             consecutive_failures = 0
+            read_done = time.perf_counter()
 
             try:
                 frame = cv2.flip(frame, 1)
                 state.frame_h, state.frame_w = frame.shape[:2]
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 processed = hands.process(frame_rgb)
+                track_done = time.perf_counter()
+                draw_active_area(frame)
 
                 landmark_list = []
                 tracking_active = False
@@ -605,6 +773,21 @@ def main():
                     if not exclude_window_from_capture(WINDOW_NAME):
                         log.info("Could not hide the camera window from screenshots; it may appear in them.")
 
+                frame_done = time.perf_counter()
+                if frame_done - loop_start > STALL_LOG_SECONDS and time.time() - last_stall_log > 1.0:
+                    # Where did the time go? Camera wait = the webcam delivered late
+                    # (often low light -> low FPS); tracking = MediaPipe; rest = our code.
+                    last_stall_log = time.time()
+                    log.warning(
+                        "Slow frame: %.0f ms (camera wait %.0f, hand tracking %.0f, gestures+drawing %.0f) | gesture=%s cursor=%s",
+                        (frame_done - loop_start) * 1000,
+                        (read_done - loop_start) * 1000,
+                        (track_done - read_done) * 1000,
+                        (frame_done - track_done) * 1000,
+                        state.gesture_label,
+                        state.cursor_status,
+                    )
+
                 consecutive_frame_errors = 0
 
             except Exception as exc:
@@ -625,8 +808,11 @@ def main():
                     )
                     break
 
-            if cv2.waitKey(1) & 0xFF == ord("q"):
+            key = read_key()
+            if key == ord("q"):
                 break
+            if key == ord("d"):
+                state.show_distances = not state.show_distances
 
     except KeyboardInterrupt:
         log.info("Interrupted by user.")

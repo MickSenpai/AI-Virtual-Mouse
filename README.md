@@ -73,12 +73,14 @@ Webcam → MediaPipe Hand Detection → 21-Point Landmarks → Gesture Classific
 | Gesture | Hand Pose | Action |
 |---|---|---|
 | **Move** | Index finger extended, thumb resting near the base of the index finger | Cursor follows your fingertip |
-| **Left Click** | Index finger bent, middle finger straight | Single left click |
-| **Right Click** | Middle finger bent, index finger straight | Single right click |
+| **Left Click** | Keep the index finger pointing and touch your thumb tip to your middle fingertip | Single left click (the cursor stays put while you pinch) |
+| **Right Click** | Keep the index finger pointing and touch your thumb tip to your ring fingertip | Single right click |
 | **Double Click** | Both index and middle fingers bent | OS double-click |
 | **Drag & Drop** | Pinch thumb tip and index tip together, move, then release | Holds left button while pinched, releases on open |
 | **Scroll Up / Down** | Index, middle, and ring fingers extended; pinky curled — move hand up or down | Scrolls the active window |
 | **Screenshot** | Index and middle fingers bent, thumb close to the base of the index finger | Saves a timestamped screenshot |
+
+> 👆 **Click pinches:** a pinch only counts after the fingertips were seen *apart* first, so start with the middle (or ring) finger away from your thumb, then touch them. A hand that rests with the thumb already touching a curled finger will not click by itself. Press **`d`** in the video window to show the live thumb-to-fingertip distances while you tune `CLICK_PINCH_THRESHOLD` / `CLICK_PINCH_RELEASE`.
 
 > 💡 Tip: Keep gestures deliberate and hold them briefly — this gives MediaPipe a stable frame to classify and avoids accidental misfires.
 
@@ -133,7 +135,8 @@ python main.py
 
 - A window titled **"AI Virtual Mouse"** will open showing your webcam feed with hand landmarks and the status overlay.
 - Perform any gesture from the [Gesture Guide](#gesture-guide) to control your cursor.
-- Press **`q`** with the video window focused to quit.
+- The faint rectangle in the video is the area your **fingertip** sweeps to cover the whole screen. Keep your fingertip inside it and your wrist inside the frame; a partly visible hand is tracked poorly.
+- Press **`q`** with the video window focused to quit, or **`d`** to toggle the pinch-distance readout.
 
 Because your hand is driving the cursor, there are also **global hotkeys** that work no matter which window has focus:
 
@@ -153,8 +156,15 @@ All tunable behavior lives as named constants at the top of `main.py` — no nee
 | Constant | Default | Description |
 |---|---|---|
 | `SMOOTHING` | `0.7` | EMA smoothing factor for the cursor (higher = smoother but laggier) |
-| `FRAME_MARGIN` | `100` px | Inset used when mapping the camera frame to the full screen |
+| `FRAME_MARGIN_LEFT` / `_RIGHT` / `_TOP` / `_BOTTOM` | `100` / `100` / `40` / `200` px | Inset of the camera region that the fingertip maps to the full screen. The bottom margin is large so reaching the bottom of the screen doesn't push your wrist out of the frame |
 | `CLICK_COOLDOWN` | `0.5` s | Minimum interval between left/right clicks |
+| `CLICK_PINCH_THRESHOLD` | `40` | Thumb-to-middle/ring-fingertip distance below which a click pinch closes (normalized by hand size) |
+| `CLICK_PINCH_RELEASE` | `70` | Distance above which the pinch counts as open again (hysteresis; must be larger than the threshold) |
+| `CLICK_PINCH_FRAMES` | `2` | Consecutive frames the pinch must stay closed to click |
+| `CLICK_FREEZE_SECONDS` | `0.3` s | After a pinch click the cursor stays put for this long (or until the pinch opens), so the click lands where you aimed |
+| `MOVE_STAY_ANGLE` / `MOVE_STAY_THUMB_DIST` | `70°` / `90` | Looser limits that keep the Move pose alive once it is active, so a thumb that drifts or an index that dips a little doesn't stop the cursor |
+| `STALL_LOG_SECONDS` | `0.15` s | Frames slower than this are logged with a breakdown (camera wait / hand tracking / gestures + drawing) |
+| `HAND_LOST_GRACE` | `0.3` s | When tracking drops, the cursor, drag and gesture state are held this long before resetting, so brief losses near the frame edge don't interrupt control |
 | `DOUBLE_CLICK_COOLDOWN` | `1.0` s | Minimum interval between double clicks |
 | `SCREENSHOT_COOLDOWN` | `2.0` s | Minimum interval between screenshots |
 | `SCROLL_COOLDOWN` | `0.15` s | Minimum interval between individual scroll ticks |
@@ -201,8 +211,11 @@ pytest
 | `[ERROR] Could not open the camera` | Camera is in use by another app, or index `0` isn't your camera | Close other apps using the camera; try `cv2.VideoCapture(1)` |
 | Cursor is jittery | Poor lighting or a noisy webcam | Increase `SMOOTHING` or `DEAD_ZONE` in `main.py` |
 | Clicks fire by accident | A gesture is briefly misread for one frame | Increase `GESTURE_CONFIRM_FRAMES`, or `CLICK_COOLDOWN` / `DOUBLE_CLICK_COOLDOWN` |
-| Cursor doesn't reach screen edges | `FRAME_MARGIN` too large | Lower `FRAME_MARGIN` |
+| Cursor doesn't reach screen edges | The `FRAME_MARGIN_*` region is too large for your reach | Lower the margins (but keep the wrist inside the frame) |
+| Clicks don't register | The click pinch never "opened", or the distances differ for your hand | Press `d` to see the live distances and adjust `CLICK_PINCH_THRESHOLD` / `CLICK_PINCH_RELEASE`; start each click with the finger away from the thumb |
 | Gestures aren't recognized | Hand too close/far, poor lighting, or busy background | Improve lighting, use a plain background, stay ~40–70 cm from the camera |
+| Tracking lags badly when the window is minimized or behind other apps | Windows throttles background processes (slower CPU, coarser timers) | Handled automatically on Windows 10 1709+/11 (the app opts out of the throttling and never sleeps in its event loop). If it still lags, check *Power mode* / battery saver and that the process isn't in Task Manager's *Efficiency mode* |
+| The cursor freezes at times | See the `Cursor:` line in the overlay: `held (click pinch)`, `held (hand lost)`, `idle (pose: …)` or `idle (no hand)` tell you why it isn't following your finger. A `[WARNING] Slow frame: …` line in the terminal shows whether the time went to the camera (low light makes webcams drop their frame rate), MediaPipe, or the rest | Fix whichever the readout points at: improve lighting, keep the hand fully in frame, or loosen the thresholds above |
 | Low FPS | Camera resolution too high, or CPU-bound machine | Lower `CAMERA_WIDTH`/`CAMERA_HEIGHT`, or reduce MediaPipe `model_complexity` |
 
 ## Roadmap
